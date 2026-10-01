@@ -70,23 +70,28 @@ def main():
     # =========================================================================
     print("[2/6] Fitting Gaussian Hidden Markov Model...")
     df["gk_vol"] = get_garman_klass_vol(df["open"], df["high"], df["low"], df["close"])
-    hmm_data = df[["log_ret", "gk_vol"]].dropna()
+    
+    # CRITICAL FIX: Drop initial warm-up rows to prevent NaN propagation
+    df = df.dropna(subset=["log_ret", "gk_vol"]).copy()
+    hmm_data = df[["log_ret", "gk_vol"]]
 
     hmm = GaussianHMM(n_components=3, covariance_type="full", n_iter=1000, random_state=42)
     hmm.fit(hmm_data)
     
-    # CRITICAL: HMM states are randomly assigned numbers. We must sort them by 
-    # average volatility so State 0 is ALWAYS Low-Vol, State 2 is ALWAYS Panic.
+    # Sort states by volatility so State 0 = Low-Vol, State 2 = Panic
     state_variances = np.array([np.diag(hmm.covars_[i])[1] for i in range(3)])
     sorted_states = np.argsort(state_variances)
     state_map = {sorted_states[i]: i for i in range(3)}
     
     probs = hmm.predict_proba(hmm_data)
+    prob_cols = [f"hmm_prob_{i}" for i in range(3)]
+    
     for i in range(3):
         mapped_idx = state_map[i]
-        df.loc[hmm_data.index, f"hmm_prob_{mapped_idx}"] = probs[:, i]
+        df[f"hmm_prob_{mapped_idx}"] = probs[:, i]
 
-    df["hmm_regime"] = df[[f"hmm_prob_{i}" for i in range(3)]].idxmax(axis=1).apply(lambda x: int(x[-1]))
+    # Vectorized state extraction (no apply/lambda string slicing)
+    df["hmm_regime"] = np.argmax(df[prob_cols].values, axis=1)
 
     # =========================================================================
     # 3. MASSIVE ORTHOGONAL FEATURE ENGINEERING
@@ -210,23 +215,23 @@ def main():
     regime_names = {0: "Low Volatility (Bull Trend)", 1: "Medium Volatility (Choppy)", 2: "High Volatility (Panic/Bear)"}
 
     dashboard = f"""
-    =========================================================
-      NIFTY 50 REGIME PREDICTOR - MAX POTENTIAL YIELD
-    =========================================================
-    Date:           {df.index[-1].strftime('%d %b %Y')}
-    Last Close:     {current_price:,.2f}
-    India VIX:      {current_vix:.2f}
-    Current State:  Regime {curr_regime} - {regime_names.get(curr_regime, "Unknown")}
-    ---------------------------------------------------------
-    FORECASTS:
-    {report_df.to_string(index=False)}
-    ---------------------------------------------------------
-    TOP MODEL DRIVERS TODAY:
-    1. {top_features[0].upper()}
-    2. {top_features[1].upper()}
-    3. {top_features[2].upper()}
-    =========================================================
-    """
+=========================================================
+  NIFTY 50 REGIME PREDICTOR - MAX POTENTIAL YIELD
+=========================================================
+Date:           {df.index[-1].strftime('%d %b %Y')}
+Last Close:     {current_price:,.2f}
+India VIX:      {current_vix:.2f}
+Current State:  Regime {curr_regime} - {regime_names.get(curr_regime, "Unknown")}
+---------------------------------------------------------
+FORECASTS:
+{report_df.to_string(index=False)}
+---------------------------------------------------------
+TOP MODEL DRIVERS TODAY:
+1. {top_features[0].upper()}
+2. {top_features[1].upper()}
+3. {top_features[2].upper()}
+=========================================================
+"""
     
     print(dashboard)
 
