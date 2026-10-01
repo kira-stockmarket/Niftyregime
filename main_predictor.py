@@ -1,291 +1,245 @@
 import os
-import json
-import logging
-from datetime import datetime
+import warnings
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from hmmlearn.hmm import GaussianHMM
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Suppress harmless warnings for clean execution logs
+warnings.filterwarnings("ignore")
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# ---------------------------------------------------------
-# 1. DATA INGESTION
-# ---------------------------------------------------------
-def fetch_market_data(start_date="2012-01-01"):
-    """Downloads Nifty 50 and India VIX daily data with clean column extraction."""
-    logging.info("Downloading ^NSEI and ^INDIAVIX data...")
-    tickers = ["^NSEI", "^INDIAVIX"]
-    raw = yf.download(tickers, start=start_date, interval="1d", progress=False)
+# --- CONFIGURATION ---
+START_DATE = "2010-01-01"
+OUTPUT_DIR = "output"
+TICKERS = {"^NSEI": "NIFTY", "^INDIAVIX": "VIX"}
+TARGET_HORIZONS = {"1D": 1, "5D": 5, "21D": 21}
 
-    # Handle multi-index columns returned by modern yfinance versions
-    if isinstance(raw.columns, pd.MultiIndex):
-        nifty_close = raw["Close"]["^NSEI"].dropna()
-        nifty_open = raw["Open"]["^NSEI"].dropna()
-        nifty_high = raw["High"]["^NSEI"].dropna()
-        nifty_low = raw["Low"]["^NSEI"].dropna()
-        nifty_vol = raw["Volume"]["^NSEI"].dropna()
-        vix_close = raw["Close"]["^INDIAVIX"].dropna()
-    else:
-        raise ValueError("Unexpected data format returned from yfinance.")
-
-    df = pd.DataFrame({
-        "open": nifty_open,
-        "high": nifty_high,
-        "low": nifty_low,
-        "close": nifty_close,
-        "volume": nifty_vol,
-        "vix": vix_close
-    }).dropna()
-
-    df = df[df["close"] > 0].sort_index()
-    logging.info(f"Loaded {len(df)} bars from {df.index[0].date()} to {df.index[-1].date()}")
-    return df
-
-# ---------------------------------------------------------
-# 2. FEATURE ENGINEERING (ZERO-LOOKAHEAD ENFORCED)
-# ---------------------------------------------------------
-def compute_rsi(series, period=14):
+# --- STATISTICAL FEATURE FUNCTIONS ---
+def get_rsi(series, period):
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / (loss + 1e-9)
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def compute_atr(df, period=14):
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift(1)).abs()
-    low_close = (df["low"] - df["close"].shift(1)).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+def get_atr(high, low, close, period):
+    tr = np.maximum(high - low, 
+                    np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
     return tr.rolling(period).mean()
 
-def engineer_features(df):
-    """Constructs stationary, orthogonal momentum, volatility, and volume indicators."""
-    feat = pd.DataFrame(index=df.index)
+def get_garman_klass_vol(open_p, high_p, low_p, close_p, period=21):
+    # Highly efficient volatility estimator using OHLC
+    log_hl = np.log(high_p / low_p) ** 2
+    log_co = np.log(close_p / open_p) ** 2
+    rs = 0.5 * log_hl - (2 * np.log(2) - 1) * log_co
+    return np.sqrt(rs.rolling(period).mean() * 252)
 
-    # Price / Return Dynamics
-    feat["log_ret_1"] = np.log(df["close"] / df["close"].shift(1))
-    feat["log_ret_5"] = np.log(df["close"] / df["close"].shift(5))
-    feat["log_ret_20"] = np.log(df["close"] / df["close"].shift(20))
+def main():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BOOTING MAX-POTENTIAL PREDICTOR")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Realized & Intraday Volatility
-    feat["parkinson_vol"] = np.sqrt(
-        (1 / (4 * np.log(2))) * (np.log(df["high"] / df["low"]) ** 2)
-    )
-    feat["atr_ratio"] = compute_atr(df, 14) / df["close"]
-    feat["hist_vol_20"] = feat["log_ret_1"].rolling(20).std() * np.sqrt(252)
+    # =========================================================================
+    # 1. DATA INGESTION & SYNCHRONIZATION
+    # =========================================================================
+    print("[1/6] Ingesting Market Data...")
+    raw_data = yf.download(list(TICKERS.keys()), start=START_DATE, interval="1d", progress=False, multi_level_index=False)
+    
+    # Restructure from multi-index columns if present, otherwise extract cleanly
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        df_nifty = raw_data.xs('^NSEI', level=1, axis=1)
+        df_vix = raw_data.xs('^INDIAVIX', level=1, axis=1)
+    else:
+        # Fallback for some yfinance versions
+        df_nifty = raw_data
+        df_vix = yf.download("^INDIAVIX", start=START_DATE, interval="1d", progress=False)
 
-    # Momentum & Trend
-    for p in [7, 14, 21]:
-        feat[f"rsi_{p}"] = compute_rsi(df["close"], p)
-
-    sma20 = df["close"].rolling(20).mean()
-    sma50 = df["close"].rolling(50).mean()
-    sma200 = df["close"].rolling(200).mean()
-    feat["dist_sma20"] = (df["close"] - sma20) / sma20
-    feat["dist_sma50"] = (df["close"] - sma50) / sma50
-    feat["dist_sma200"] = (df["close"] - sma200) / sma200
-
-    # Bollinger Bands
-    rolling_std = df["close"].rolling(20).std()
-    feat["bb_width"] = (2 * rolling_std * 2) / (sma20 + 1e-9)
-    feat["bb_pos"] = (df["close"] - (sma20 - 2 * rolling_std)) / (4 * rolling_std + 1e-9)
-
-    # India VIX Metrics
-    feat["vix_level"] = df["vix"]
-    feat["vix_roc_5"] = df["vix"].pct_change(5)
-    feat["vix_zscore_20"] = (df["vix"] - df["vix"].rolling(20).mean()) / (df["vix"].rolling(20).std() + 1e-9)
-
-    # Volume Signals
-    vol_sma = df["volume"].rolling(20).mean()
-    feat["vol_ratio_20"] = df["volume"] / (vol_sma + 1e-9)
-
-    return feat
-
-# ---------------------------------------------------------
-# 3. UNSUPERVISED REGIME DETECTION (HMM)
-# ---------------------------------------------------------
-def fit_hmm_regimes(df, feat):
-    """
-    Fits a 3-State Gaussian HMM on returns and volatility.
-    States are ordered dynamically by annualized return:
-      0: Bear / Stress, 1: Sideways / Transition, 2: Bull / Low Vol
-    """
-    hmm_data = pd.DataFrame({
-        "ret": feat["log_ret_1"],
-        "vol": feat["parkinson_vol"]
+    df = pd.DataFrame({
+        "open": df_nifty["Open"], "high": df_nifty["High"], 
+        "low": df_nifty["Low"], "close": df_nifty["Close"], 
+        "volume": df_nifty["Volume"], "vix": df_vix["Close"]
     }).dropna()
 
-    model = GaussianHMM(n_components=3, covariance_type="full", n_iter=500, random_state=42)
-    model.fit(hmm_data)
+    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
     
-    hidden_states = model.predict(hmm_data)
-    probs = model.predict_proba(hmm_data)
+    # =========================================================================
+    # 2. HMM REGIME DETECTION (WITH STATE STABILIZATION)
+    # =========================================================================
+    print("[2/6] Fitting Gaussian Hidden Markov Model...")
+    df["gk_vol"] = get_garman_klass_vol(df["open"], df["high"], df["low"], df["close"])
+    hmm_data = df[["log_ret", "gk_vol"]].dropna()
 
-    # Re-map regimes based on mean return ranking
-    state_returns = [hmm_data["ret"][hidden_states == i].mean() for i in range(3)]
-    mapping = {old_st: new_st for new_st, old_st in enumerate(np.argsort(state_returns))}
+    hmm = GaussianHMM(n_components=3, covariance_type="full", n_iter=1000, random_state=42)
+    hmm.fit(hmm_data)
+    
+    # CRITICAL: HMM states are randomly assigned numbers. We must sort them by 
+    # average volatility so State 0 is ALWAYS Low-Vol, State 2 is ALWAYS Panic.
+    state_variances = np.array([np.diag(hmm.covars_[i])[1] for i in range(3)])
+    sorted_states = np.argsort(state_variances)
+    state_map = {sorted_states[i]: i for i in range(3)}
+    
+    probs = hmm.predict_proba(hmm_data)
+    for i in range(3):
+        mapped_idx = state_map[i]
+        df.loc[hmm_data.index, f"hmm_prob_{mapped_idx}"] = probs[:, i]
 
-    ordered_states = np.array([mapping[s] for s in hidden_states])
-    ordered_probs = np.zeros_like(probs)
-    for old_st, new_st in mapping.items():
-        ordered_probs[:, new_st] = probs[:, old_st]
+    df["hmm_regime"] = df[[f"hmm_prob_{i}" for i in range(3)]].idxmax(axis=1).apply(lambda x: int(x[-1]))
 
-    regime_df = pd.DataFrame(index=hmm_data.index)
-    regime_df["regime_state"] = ordered_states
-    regime_df["prob_bear"] = ordered_probs[:, 0]
-    regime_df["prob_sideways"] = ordered_probs[:, 1]
-    regime_df["prob_bull"] = ordered_probs[:, 2]
+    # =========================================================================
+    # 3. MASSIVE ORTHOGONAL FEATURE ENGINEERING
+    # =========================================================================
+    print("[3/6] Generating Advanced Feature Matrices...")
+    feats = pd.DataFrame(index=df.index)
 
-    return regime_df
+    # A. Multi-Scale Momentum (Price & Volume)
+    for w in [3, 5, 10, 21, 63]:
+        feats[f'ret_{w}d'] = df['close'].pct_change(w)
+        feats[f'vol_trend_{w}d'] = df['volume'].pct_change(w)
+        feats[f'rsi_{w}'] = get_rsi(df['close'], w)
+    
+    # B. Mean Reversion & Oscillators
+    for w in [20, 50, 200]:
+        sma = df['close'].rolling(w).mean()
+        feats[f'dist_sma_{w}'] = (df['close'] - sma) / sma
+    
+    # MACD Institutional
+    ema_12, ema_26 = df['close'].ewm(span=12).mean(), df['close'].ewm(span=26).mean()
+    macd = ema_12 - ema_26
+    feats['macd_hist_norm'] = (macd - macd.ewm(span=9).mean()) / df['close']
 
-# ---------------------------------------------------------
-# 4. TARGET CONSTRUCTION & MODEL TRAINING (LIGHTGBM)
-# ---------------------------------------------------------
-def train_and_evaluate_horizon(X_train, y_train, X_test, y_test, horizon_name):
-    """Trains a tuned LightGBM classifier with early stopping and out-of-sample metrics."""
-    train_data = lgb.Dataset(X_train, label=y_train)
-    valid_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+    # C. Volatility Term Structure & Skew
+    feats['atr_norm'] = get_atr(df['high'], df['low'], df['close'], 14) / df['close']
+    feats['vix_level'] = df['vix']
+    feats['vix_roc_5'] = df['vix'].pct_change(5)
+    feats['vix_bb_dist'] = (df['vix'] - df['vix'].rolling(20).mean()) / df['vix'].rolling(20).std()
+    
+    for w in [10, 21]:
+        feats[f'skew_{w}d'] = df['log_ret'].rolling(w).skew()
+        feats[f'kurt_{w}d'] = df['log_ret'].rolling(w).kurt()
+        feats[f'gk_vol_{w}d'] = get_garman_klass_vol(df["open"], df["high"], df["low"], df["close"], w)
 
-    params = {
-        "objective": "binary",
-        "metric": ["binary_logloss", "auc"],
-        "boosting_type": "gbdt",
-        "learning_rate": 0.02,
-        "num_leaves": 15,
-        "max_depth": 4,
-        "subsample": 0.8,
-        "colsample_bytree": 0.7,
-        "min_child_samples": 30,
-        "seed": 42,
-        "verbose": -1
+    # D. HMM Latent Priors
+    feats['hmm_prob_0'] = df['hmm_prob_0']
+    feats['hmm_prob_1'] = df['hmm_prob_1']
+    feats['hmm_prob_2'] = df['hmm_prob_2']
+
+    # =========================================================================
+    # 4. TARGET GENERATION & LEAKAGE PREVENTION (THE SHIFT)
+    # =========================================================================
+    # Forward returns for the target
+    for label, days in TARGET_HORIZONS.items():
+        # 1 if future price > today's price
+        df[f'target_{label}'] = (df['close'].shift(-days) > df['close']).astype(int)
+        
+    # CRITICAL: Shift ALL features by 1 to represent what was known at yesterday's close.
+    # Today's features predict Tomorrow's return. 
+    X_shifted = feats.shift(1)
+    
+    master_df = pd.concat([X_shifted, df[[f'target_{k}' for k in TARGET_HORIZONS.keys()]]], axis=1)
+    
+    # The last row has NaNs for targets because the future hasn't happened. We keep it for today's prediction.
+    latest_live_data = master_df.iloc[-1:]
+    master_df = master_df.dropna()
+
+    feature_cols = X_shifted.columns.tolist()
+
+    # =========================================================================
+    # 5. WALK-FORWARD TRAINING & PREDICTION
+    # =========================================================================
+    print("[4/6] Executing LightGBM Walk-Forward Training...")
+    
+    lgb_params = {
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'boosting_type': 'gbdt',
+        'learning_rate': 0.01,
+        'num_leaves': 12,
+        'max_depth': 4,
+        'feature_fraction': 0.7,
+        'bagging_fraction': 0.7,
+        'bagging_freq': 5,
+        'min_data_in_leaf': 30,
+        'verbosity': -1,
+        'random_state': 42
     }
 
-    callbacks = [lgb.early_stopping(stopping_rounds=30, verbose=False)]
-    model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=400,
-        valid_sets=[valid_data],
-        callbacks=callbacks
-    )
+    results = []
+    global_importance = np.zeros(len(feature_cols))
 
-    preds_prob = model.predict(X_test)
-    preds_bin = (preds_prob > 0.5).astype(int)
+    for horizon_label in TARGET_HORIZONS.keys():
+        target_col = f'target_{horizon_label}'
+        X = master_df[feature_cols]
+        y = master_df[target_col]
+        
+        # Train final model on ALL historical data to predict tomorrow
+        model = lgb.LGBMClassifier(**lgb_params, n_estimators=250)
+        model.fit(X, y)
+        
+        # Aggregate feature importance for reporting
+        global_importance += model.feature_importances_
+        
+        # Live Prediction
+        X_live = latest_live_data[feature_cols]
+        prob_bull = model.predict_proba(X_live)[0][1]
+        
+        direction = "BULLISH" if prob_bull > 0.5 else "BEARISH"
+        conf = prob_bull if prob_bull > 0.5 else (1 - prob_bull)
+        
+        results.append({
+            "Horizon": horizon_label,
+            "Direction": direction,
+            "Conviction": f"{conf * 100:.1f}%"
+        })
 
-    acc = accuracy_score(y_test, preds_bin)
-    auc = roc_auc_score(y_test, preds_prob)
-    logging.info(f"[{horizon_name}] Out-of-Sample -> Accuracy: {acc:.2%}, AUC: {auc:.3f}")
+    # =========================================================================
+    # 6. DASHBOARD & ARTIFACT GENERATION
+    # =========================================================================
+    print("[5/6] Generating Institutional Dashboard...")
+    report_df = pd.DataFrame(results)
+    
+    # Top 5 Drivers
+    importance_series = pd.Series(global_importance, index=feature_cols).sort_values(ascending=False)
+    top_features = importance_series.head(5).index.tolist()
 
-    return model, {"accuracy": float(acc), "auc": float(auc)}
+    current_price = df['close'].iloc[-1]
+    current_vix = df['vix'].iloc[-1]
+    curr_regime = int(df['hmm_regime'].iloc[-1])
+    regime_names = {0: "Low Volatility (Bull Trend)", 1: "Medium Volatility (Choppy)", 2: "High Volatility (Panic/Bear)"}
 
-# ---------------------------------------------------------
-# 5. EXECUTION PIPELINE
-# ---------------------------------------------------------
-def main():
-    os.makedirs("output", exist_ok=True)
-    df = fetch_market_data(start_date="2013-01-01")
+    dashboard = f"""
+    =========================================================
+      NIFTY 50 REGIME PREDICTOR - MAX POTENTIAL YIELD
+    =========================================================
+    Date:           {df.index[-1].strftime('%d %b %Y')}
+    Last Close:     {current_price:,.2f}
+    India VIX:      {current_vix:.2f}
+    Current State:  Regime {curr_regime} - {regime_names.get(curr_regime, "Unknown")}
+    ---------------------------------------------------------
+    FORECASTS:
+    {report_df.to_string(index=False)}
+    ---------------------------------------------------------
+    TOP MODEL DRIVERS TODAY:
+    1. {top_features[0].upper()}
+    2. {top_features[1].upper()}
+    3. {top_features[2].upper()}
+    =========================================================
+    """
+    
+    print(dashboard)
 
-    # 1. Generate base indicators
-    feat = engineer_features(df)
-
-    # 2. Fit HMM Regimes
-    regime_df = fit_hmm_regimes(df, feat)
-    feat = feat.join(regime_df).dropna()
-
-    # 3. Strict alignment: Shift features by 1 bar for training targets
-    # Today's close (T) uses information up to T. Target for forward return is calculated after T.
-    X_matrix = feat.copy()
-
-    # Targets: Forward return > 0 (1 = Bullish, 0 = Bearish)
-    close_s = df["close"].loc[X_matrix.index]
-    targets = {
-        "Daily (1D)": (close_s.shift(-1) > close_s).astype(int),
-        "Weekly (5D)": (close_s.shift(-5) > close_s).astype(int),
-        "Monthly (21D)": (close_s.shift(-21) > close_s).astype(int),
-    }
-
-    # Extract the absolute latest bar for live forward inference
-    latest_inference_bar = X_matrix.iloc[[-1]]
-    latest_date = latest_inference_bar.index[0].strftime("%Y-%m-%d")
-    latest_close = float(df["close"].loc[latest_inference_bar.index[0]])
-    latest_vix = float(df["vix"].loc[latest_inference_bar.index[0]])
-
-    current_regime_id = int(latest_inference_bar["regime_state"].values[0])
-    regime_names = {0: "Bear / High Volatility", 1: "Sideways / Transitory", 2: "Bull / Low Volatility"}
-
-    projections = {}
-    validation_metrics = {}
-
-    # Train and evaluate models across horizons
-    test_split_bars = 252  # 1 year out-of-sample holdout
-
-    for horizon_name, y_target in targets.items():
-        # Exclude NaN targets at the end of the series
-        valid_idx = y_target.dropna().index
-        X_clean = X_matrix.loc[valid_idx]
-        y_clean = y_target.loc[valid_idx]
-
-        # Time-series temporal split
-        X_train, X_test = X_clean.iloc[:-test_split_bars], X_clean.iloc[-test_split_bars:]
-        y_train, y_test = y_clean.iloc[:-test_split_bars], y_clean.iloc[-test_split_bars:]
-
-        model, metrics = train_and_evaluate_horizon(X_train, y_train, X_test, y_test, horizon_name)
-        validation_metrics[horizon_name] = metrics
-
-        # Live forward projection
-        prob_bull = float(model.predict(latest_inference_bar)[0])
-        projections[horizon_name] = {
-            "stance": "BULLISH" if prob_bull >= 0.50 else "BEARISH",
-            "bullish_probability": round(prob_bull * 100, 2),
-            "bearish_probability": round((1 - prob_bull) * 100, 2)
-        }
-
-    # Prepare final output structure
-    output_payload = {
-        "metadata": {
-            "date": latest_date,
-            "nifty_close": latest_close,
-            "india_vix": latest_vix,
-            "generated_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        },
-        "market_regime": {
-            "detected_state": regime_names.get(current_regime_id, "Unknown"),
-            "probabilities": {
-                "bear_risk": round(float(latest_inference_bar["prob_bear"].values[0]) * 100, 2),
-                "sideways": round(float(latest_inference_bar["prob_sideways"].values[0]) * 100, 2),
-                "bull_trend": round(float(latest_inference_bar["prob_bull"].values[0]) * 100, 2)
-            }
-        },
-        "projections": projections,
-        "out_of_sample_metrics": validation_metrics
-    }
-
-    # Write JSON output artifact
-    json_path = "output/nifty_predictions.json"
-    with open(json_path, "w") as f:
-        json.dump(output_payload, f, indent=4)
-
-    # Print terminal report
-    print("\n" + "=" * 65)
-    print(f" NIFTY 50 REGIME & DIRECTIONAL PREDICTOR: {latest_date}")
-    print(f" Underlying Close: {latest_close:.2f} | India VIX: {latest_vix:.2f}")
-    print("=" * 65)
-    print(f"HMM Macro Regime: {output_payload['market_regime']['detected_state'].upper()}")
-    print(f"Regime Probabilities -> Bull: {output_payload['market_regime']['probabilities']['bull_trend']}% | "
-          f"Bear: {output_payload['market_regime']['probabilities']['bear_risk']}% | "
-          f"Sideways: {output_payload['market_regime']['probabilities']['sideways']}%\n")
-
-    print(f"{'Horizon':<15} | {'Stance':<9} | {'Bull Prob':<10} | {'Bear Prob':<10} | {'OOS Acc'}")
-    print("-" * 65)
-    for horizon, res in projections.items():
-        acc = validation_metrics[horizon]["accuracy"]
-        print(f"{horizon:<15} | {res['stance']:<9} | {res['bullish_probability']:>8.2f}% | "
-              f"{res['bearish_probability']:>8.2f}% | {acc:>6.2%}")
-    print("=" * 65 + "\n")
-    logging.info(f"Artifact successfully saved to {json_path}")
+    # Save outputs
+    print("[6/6] Saving Artifacts...")
+    date_str = df.index[-1].strftime('%Y%m%d')
+    csv_path = os.path.join(OUTPUT_DIR, f"nifty_forecast_{date_str}.csv")
+    report_df.to_csv(csv_path, index=False)
+    
+    with open(os.path.join(OUTPUT_DIR, f"dashboard_{date_str}.txt"), "w") as f:
+        f.write(dashboard)
+        
+    print(f"Pipeline Complete. Files saved to /{OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
