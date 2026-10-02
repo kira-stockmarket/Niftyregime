@@ -14,7 +14,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 START_DATE = "2010-01-01"
 TICKERS = {"^NSEI": "NIFTY", "^INDIAVIX": "VIX"}
 INITIAL_TRAIN_DAYS = 1260  # Train on 5 years initially
-STEP_DAYS = 126            # Retrain every 6 months to predict the next 6 months
+STEP_DAYS = 126            # Retrain every 6 months
 
 def get_rsi(series, period):
     delta = series.diff()
@@ -33,7 +33,6 @@ def get_garman_klass_vol(open_p, high_p, low_p, close_p, period=21):
     return np.sqrt(rs.rolling(period).mean() * 252)
 
 def calculate_metrics(returns_series, name="Strategy"):
-    # Assume 0% risk-free rate for simplicity in comparison
     ann_ret = np.exp(returns_series.mean() * 252) - 1
     ann_vol = returns_series.std() * np.sqrt(252)
     sharpe = ann_ret / ann_vol if ann_vol != 0 else 0
@@ -70,15 +69,20 @@ def main():
     df["gk_vol"] = get_garman_klass_vol(df["open"], df["high"], df["low"], df["close"])
     df = df.dropna(subset=["log_ret", "gk_vol"]).copy()
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fitting Global HMM...")
-    # For backtesting, fitting HMM globally introduces slight lookahead in regime definitions, 
-    # but the probabilities are causal. For perfect isolation, this goes inside the loop.
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fitting Global HMM with State Sorting...")
     hmm_data = df[["log_ret", "gk_vol"]]
     hmm = GaussianHMM(n_components=3, covariance_type="full", n_iter=1000, random_state=42)
     hmm.fit(hmm_data)
     
+    # CRITICAL: Sort HMM states so State 0 is ALWAYS Low Volatility (Bull Regime)
+    state_variances = np.array([np.diag(hmm.covars_[i])[1] for i in range(3)])
+    sorted_states = np.argsort(state_variances)
+    state_map = {sorted_states[i]: i for i in range(3)}
+    
     probs = hmm.predict_proba(hmm_data)
-    for i in range(3): df[f"hmm_prob_{i}"] = probs[:, i]
+    for i in range(3): 
+        mapped_idx = state_map[i]
+        df[f"hmm_prob_{mapped_idx}"] = probs[:, i]
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Engineering Features...")
     feats = pd.DataFrame(index=df.index)
@@ -100,13 +104,13 @@ def main():
 
     for i in range(3): feats[f'hmm_prob_{i}'] = df[f'hmm_prob_{i}']
 
-    # Target & Shift
-    df['target_1D'] = (df['close'].shift(-1) > df['close']).astype(int)
+    # FIX 1: Change to 5D Horizon to reduce daily whipsaw
+    df['target_5D'] = (df['close'].shift(-5) > df['close']).astype(int)
     X_shifted = feats.shift(1)
     
-    master_df = pd.concat([X_shifted, df[['target_1D']]], axis=1).dropna()
-    X = master_df.drop(columns=['target_1D'])
-    y = master_df['target_1D']
+    master_df = pd.concat([X_shifted, df[['target_5D']]], axis=1).dropna()
+    X = master_df.drop(columns=['target_5D'])
+    y = master_df['target_5D']
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing Out-of-Sample Walk-Forward Backtest...")
     
@@ -115,7 +119,6 @@ def main():
     
     oof_predictions = pd.Series(index=X.index, dtype=float)
     
-    # Walk-forward loop
     for i in range(INITIAL_TRAIN_DAYS, len(X), STEP_DAYS):
         train_end = i
         test_end = min(i + STEP_DAYS, len(X))
@@ -128,37 +131,40 @@ def main():
         
         oof_predictions.iloc[train_end:test_end] = model.predict_proba(X_test)[:, 1]
 
-    # Align dates and calculate returns
+    # Align predictions with price data
     backtest_data = df.loc[oof_predictions.dropna().index].copy()
     backtest_data['prob_bull'] = oof_predictions.dropna()
     
-    # Strategy Rules: Long Nifty if Bullish > 50%, else hold Cash (0% return)
-    backtest_data['position'] = (backtest_data['prob_bull'] > 0.5).astype(int)
+    # FIX 2: Regime Trend Filter
+    # Rule: Stay Long if HMM detects a low volatility bull market (>50% probability).
+    # Otherwise, follow the LightGBM 5D prediction.
+    is_bull_regime = backtest_data['hmm_prob_0'] > 0.5
+    is_model_bullish = backtest_data['prob_bull'] > 0.5
     
-    # Strategy Return = Position from yesterday * Today's Return
+    backtest_data['position'] = np.where(is_bull_regime | is_model_bullish, 1, 0)
+    
+    # Calculate returns (Execution at tomorrow's open/close based on today's signal)
     backtest_data['strat_ret'] = backtest_data['position'].shift(1) * backtest_data['log_ret']
     backtest_data['bnh_ret'] = backtest_data['log_ret']
-    
     backtest_data = backtest_data.dropna()
 
     # Calculate and Print Metrics
-    strat_metrics = calculate_metrics(backtest_data['strat_ret'], name="AI Regime Predictor")
+    strat_metrics = calculate_metrics(backtest_data['strat_ret'], name="AI Regime Predictor (5D Filtered)")
     bnh_metrics = calculate_metrics(backtest_data['bnh_ret'], name="Buy & Hold (Nifty 50)")
 
-    print("\n" + "="*65)
-    print(" OUT-OF-SAMPLE BACKTEST RESULTS ".center(65, "="))
+    print("\n" + "="*70)
+    print(" OUT-OF-SAMPLE BACKTEST RESULTS ".center(70, "="))
     print(f" Testing Period: {backtest_data.index[0].strftime('%Y-%m-%d')} to {backtest_data.index[-1].strftime('%Y-%m-%d')}")
-    print("="*65)
+    print("="*70)
     
     metrics_df = pd.DataFrame([bnh_metrics, strat_metrics]).set_index("Name")
     print(metrics_df.to_markdown())
-    print("="*65)
+    print("="*70)
     
-    # Save Equity Curve for charting
     backtest_data['cum_strat'] = np.exp(backtest_data['strat_ret'].cumsum())
     backtest_data['cum_bnh'] = np.exp(backtest_data['bnh_ret'].cumsum())
     backtest_data[['cum_strat', 'cum_bnh']].to_csv("equity_curve.csv")
-    print("\nEquity curve saved to equity_curve.csv. You can plot this in Excel or Python.")
+    print("\nEquity curve saved to equity_curve.csv.")
 
 if __name__ == "__main__":
     main()
