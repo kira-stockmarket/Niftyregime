@@ -69,12 +69,12 @@ def main():
     df["gk_vol"] = get_garman_klass_vol(df["open"], df["high"], df["low"], df["close"])
     df = df.dropna(subset=["log_ret", "gk_vol"]).copy()
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fitting Global HMM with State Sorting...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fitting Global HMM (State 2 = Panic)...")
     hmm_data = df[["log_ret", "gk_vol"]]
     hmm = GaussianHMM(n_components=3, covariance_type="full", n_iter=1000, random_state=42)
     hmm.fit(hmm_data)
     
-    # CRITICAL: Sort HMM states so State 0 is ALWAYS Low Volatility (Bull Regime)
+    # Sort states: 0 = Low Vol Bull, 1 = Mid Vol Choppy, 2 = High Vol Panic
     state_variances = np.array([np.diag(hmm.covars_[i])[1] for i in range(3)])
     sorted_states = np.argsort(state_variances)
     state_map = {sorted_states[i]: i for i in range(3)}
@@ -84,7 +84,7 @@ def main():
         mapped_idx = state_map[i]
         df[f"hmm_prob_{mapped_idx}"] = probs[:, i]
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Engineering Features...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Engineering Orthogonal Features...")
     feats = pd.DataFrame(index=df.index)
     for w in [3, 5, 10, 21, 63]:
         feats[f'ret_{w}d'] = df['close'].pct_change(w)
@@ -104,18 +104,25 @@ def main():
 
     for i in range(3): feats[f'hmm_prob_{i}'] = df[f'hmm_prob_{i}']
 
-    # FIX 1: Change to 5D Horizon to reduce daily whipsaw
+    # Target: 5D Forward Direction
     df['target_5D'] = (df['close'].shift(-5) > df['close']).astype(int)
     X_shifted = feats.shift(1)
     
-    master_df = pd.concat([X_shifted, df[['target_5D']]], axis=1).dropna()
-    X = master_df.drop(columns=['target_5D'])
+    master_df = pd.concat([X_shifted, df[['target_5D', 'log_ret']]], axis=1).dropna()
+    X = master_df.drop(columns=['target_5D', 'log_ret'])
     y = master_df['target_5D']
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing Out-of-Sample Walk-Forward Backtest...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing Asymmetric Walk-Forward Backtest...")
     
-    lgb_params = {'objective': 'binary', 'learning_rate': 0.01, 'num_leaves': 12, 
-                  'max_depth': 4, 'feature_fraction': 0.7, 'verbosity': -1, 'random_state': 42}
+    lgb_params = {
+        'objective': 'binary', 
+        'learning_rate': 0.01, 
+        'num_leaves': 12, 
+        'max_depth': 4, 
+        'feature_fraction': 0.7, 
+        'verbosity': -1, 
+        'random_state': 42
+    }
     
     oof_predictions = pd.Series(index=X.index, dtype=float)
     
@@ -126,8 +133,13 @@ def main():
         X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
         X_test = X.iloc[train_end:test_end]
         
+        # ASYMMETRIC TRAINING: Force the model to hate drawdowns.
+        # We give a 2.0x weight to periods where the market fell (y=0). 
+        # This makes the ML probability highly conservative.
+        train_weights = np.where(y_train == 0, 2.0, 1.0)
+        
         model = lgb.LGBMClassifier(**lgb_params, n_estimators=250)
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, sample_weight=train_weights)
         
         oof_predictions.iloc[train_end:test_end] = model.predict_proba(X_test)[:, 1]
 
@@ -135,31 +147,37 @@ def main():
     backtest_data = df.loc[oof_predictions.dropna().index].copy()
     backtest_data['prob_bull'] = oof_predictions.dropna()
     
-    # FIX 2: Regime Trend Filter
-    # Rule: Stay Long if HMM detects a low volatility bull market (>50% probability).
-    # Otherwise, follow the LightGBM 5D prediction.
-    is_bull_regime = backtest_data['hmm_prob_0'] > 0.5
-    is_model_bullish = backtest_data['prob_bull'] > 0.5
+    # =========================================================================
+    # THE MAXIMUM CAPITAL PRESERVATION LOGIC
+    # =========================================================================
+    # 1. If HMM says we are in Regime 2 (High Volatility Panic) -> NEVER HOLD. 
+    # 2. If HMM says Regime 0 or 1 -> Trust the conservative LightGBM model.
+    # 3. If Model Conviction > 50% -> Go Long. Otherwise -> Cash.
     
-    backtest_data['position'] = np.where(is_bull_regime | is_model_bullish, 1, 0)
+    is_panic = backtest_data['hmm_prob_2'] > 0.50
+    is_bullish = backtest_data['prob_bull'] > 0.50
     
-    # Calculate returns (Execution at tomorrow's open/close based on today's signal)
+    # np.where(condition, true_value, false_value)
+    # If it is NOT a panic regime AND the model is bullish, take the trade.
+    backtest_data['position'] = np.where((~is_panic) & is_bullish, 1, 0)
+    
+    # Calculate returns
     backtest_data['strat_ret'] = backtest_data['position'].shift(1) * backtest_data['log_ret']
     backtest_data['bnh_ret'] = backtest_data['log_ret']
     backtest_data = backtest_data.dropna()
 
     # Calculate and Print Metrics
-    strat_metrics = calculate_metrics(backtest_data['strat_ret'], name="AI Regime Predictor (5D Filtered)")
+    strat_metrics = calculate_metrics(backtest_data['strat_ret'], name="AI Regime Predictor (Asymmetric + Panic Block)")
     bnh_metrics = calculate_metrics(backtest_data['bnh_ret'], name="Buy & Hold (Nifty 50)")
 
-    print("\n" + "="*70)
-    print(" OUT-OF-SAMPLE BACKTEST RESULTS ".center(70, "="))
+    print("\n" + "="*80)
+    print(" OUT-OF-SAMPLE BACKTEST RESULTS ".center(80, "="))
     print(f" Testing Period: {backtest_data.index[0].strftime('%Y-%m-%d')} to {backtest_data.index[-1].strftime('%Y-%m-%d')}")
-    print("="*70)
+    print("="*80)
     
     metrics_df = pd.DataFrame([bnh_metrics, strat_metrics]).set_index("Name")
     print(metrics_df.to_markdown())
-    print("="*70)
+    print("="*80)
     
     backtest_data['cum_strat'] = np.exp(backtest_data['strat_ret'].cumsum())
     backtest_data['cum_bnh'] = np.exp(backtest_data['bnh_ret'].cumsum())
