@@ -1,0 +1,46 @@
+name: Institutional Regime Pipeline
+
+on:
+  schedule:
+    # Runs at 16:00 IST (10:30 UTC), Monday to Friday, capturing closing market microstructure
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch: 
+
+jobs:
+  execute_and_commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip' 
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Daily Inference (^NSEI)
+        run: python src/quant_pipeline.py --mode inference --ticker ^NSEI
+
+      - name: Execute Daily Inference (Core Equities)
+        run: |
+          python src/quant_pipeline.py --mode inference --ticker INFY.NS
+          python src/quant_pipeline.py --mode inference --ticker ASIANPAINT.NS
+          python src/quant_pipeline.py --mode inference --ticker BAJFINANCE.NS
+
+      - name: Commit Artifacts to Repository
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "System Update: Institutional Regime Inference [skip ci]"
+          branch: main
+          file_pattern: 'data/*.sqlite results/*.json'
