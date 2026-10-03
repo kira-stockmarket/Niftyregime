@@ -1,0 +1,45 @@
+name: Nifty 50 Regime Prediction Pipeline
+
+on:
+  schedule:
+    # Runs at 16:00 IST (10:30 UTC), Monday to Friday
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch: # Allows manual triggering from the GitHub UI
+
+jobs:
+  predict_and_commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required permission for the auto-commit action
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip' # Caches ML libraries to keep runtime under free-tier limits
+
+      - name: Create Data and Results Directories
+        run: |
+          mkdir -p data
+          mkdir -p results
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy hmmlearn xgboost stable-baselines3
+
+      - name: Execute Inference Script
+        run: python src/pipeline_inference.py
+
+      - name: Commit and Push Changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Automated inference: Nifty 50 Regime Update [skip ci]"
+          branch: main
+          file_pattern: 'data/*.sqlite results/*.json'
