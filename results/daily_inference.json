@@ -1,0 +1,11 @@
+{
+    "timestamp": "2026-10-03T06:15:13.712224",
+    "latest_close": 22421.94921875,
+    "meta_probability_success": 0.9157626032829285,
+    "target_allocation_weight": 0.9157626032829285,
+    "regime_probabilities": {
+        "r1": 0.9749871139940675,
+        "r2": 2.8974157701464433e-06,
+        "r3": 0.025009988590345787
+    }
+}
