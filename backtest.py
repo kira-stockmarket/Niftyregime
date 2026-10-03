@@ -16,6 +16,11 @@ TICKERS = {"^NSEI": "NIFTY", "^INDIAVIX": "VIX"}
 INITIAL_TRAIN_DAYS = 1260  # Train on 5 years initially
 STEP_DAYS = 126            # Retrain every 6 months
 
+# --- REAL-WORLD FRICTION ---
+# 0.15% per trade accounts for Indian STT (Delivery/ETF), Exchange Charges, 
+# SEBI turnover fees, GST, Brokerage, and average Bid-Ask Slippage.
+FRICTION_PER_TRADE = 0.0015 
+
 def get_rsi(series, period):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -44,9 +49,9 @@ def calculate_metrics(returns_series, name="Strategy"):
     return {
         "Name": name,
         "Total Return": f"{total_ret:.2%}",
-        "Annual Return": f"{ann_ret:.2%}",
-        "Annual Volatility": f"{ann_vol:.2%}",
-        "Sharpe Ratio": f"{sharpe:.2f}",
+        "Ann Return": f"{ann_ret:.2%}",
+        "Ann Volatility": f"{ann_vol:.2%}",
+        "Sharpe": f"{sharpe:.2f}",
         "Max Drawdown": f"{max_dd:.2%}"
     }
 
@@ -69,12 +74,12 @@ def main():
     df["gk_vol"] = get_garman_klass_vol(df["open"], df["high"], df["low"], df["close"])
     df = df.dropna(subset=["log_ret", "gk_vol"]).copy()
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fitting Global HMM (State 2 = Panic)...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fitting Global HMM (State 0 = Bull, State 2 = Panic)...")
     hmm_data = df[["log_ret", "gk_vol"]]
     hmm = GaussianHMM(n_components=3, covariance_type="full", n_iter=1000, random_state=42)
     hmm.fit(hmm_data)
     
-    # Sort states: 0 = Low Vol Bull, 1 = Mid Vol Choppy, 2 = High Vol Panic
+    # Sort states by volatility variance
     state_variances = np.array([np.diag(hmm.covars_[i])[1] for i in range(3)])
     sorted_states = np.argsort(state_variances)
     state_map = {sorted_states[i]: i for i in range(3)}
@@ -112,7 +117,7 @@ def main():
     X = master_df.drop(columns=['target_5D', 'log_ret'])
     y = master_df['target_5D']
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing Asymmetric Walk-Forward Backtest...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing Walk-Forward Machine Learning Pipeline...")
     
     lgb_params = {
         'objective': 'binary', 
@@ -133,13 +138,9 @@ def main():
         X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
         X_test = X.iloc[train_end:test_end]
         
-        # ASYMMETRIC TRAINING: Force the model to hate drawdowns.
-        # We give a 2.0x weight to periods where the market fell (y=0). 
-        # This makes the ML probability highly conservative.
-        train_weights = np.where(y_train == 0, 2.0, 1.0)
-        
+        # Standard LightGBM without the broken asymmetric weights
         model = lgb.LGBMClassifier(**lgb_params, n_estimators=250)
-        model.fit(X_train, y_train, sample_weight=train_weights)
+        model.fit(X_train, y_train)
         
         oof_predictions.iloc[train_end:test_end] = model.predict_proba(X_test)[:, 1]
 
@@ -148,41 +149,57 @@ def main():
     backtest_data['prob_bull'] = oof_predictions.dropna()
     
     # =========================================================================
-    # THE MAXIMUM CAPITAL PRESERVATION LOGIC
+    # INSTITUTIONAL REGIME-CONDITIONED EXPOSURE
     # =========================================================================
-    # 1. If HMM says we are in Regime 2 (High Volatility Panic) -> NEVER HOLD. 
-    # 2. If HMM says Regime 0 or 1 -> Trust the conservative LightGBM model.
-    # 3. If Model Conviction > 50% -> Go Long. Otherwise -> Cash.
+    is_bull_regime = backtest_data['hmm_prob_0'] > 0.5
+    is_panic_regime = backtest_data['hmm_prob_2'] > 0.5
+    is_model_bullish = backtest_data['prob_bull'] > 0.5
     
-    is_panic = backtest_data['hmm_prob_2'] > 0.50
-    is_bullish = backtest_data['prob_bull'] > 0.50
+    conditions = [
+        is_panic_regime,  # If Panic -> Cash
+        is_bull_regime    # If Bull -> Long
+    ]
+    choices = [0, 1]
     
-    # np.where(condition, true_value, false_value)
-    # If it is NOT a panic regime AND the model is bullish, take the trade.
-    backtest_data['position'] = np.where((~is_panic) & is_bullish, 1, 0)
+    # Default to LightGBM ML logic during the choppy transitions (Regime 1)
+    backtest_data['position'] = np.select(conditions, choices, default=np.where(is_model_bullish, 1, 0))
     
-    # Calculate returns
-    backtest_data['strat_ret'] = backtest_data['position'].shift(1) * backtest_data['log_ret']
+    # =========================================================================
+    # REAL-WORLD FRICTION CALCULATIONS
+    # =========================================================================
+    # Calculate absolute changes in position (0 to 1 = 1 trade, 1 to 0 = 1 trade)
+    backtest_data['trades'] = backtest_data['position'].diff().abs().fillna(0)
+    
+    # Log Return calculation (Position shifted by 1 day as we act at tomorrow's open)
+    backtest_data['strat_ret_gross'] = backtest_data['position'].shift(1) * backtest_data['log_ret']
+    
+    # Subtract Transaction Friction for every trade executed
+    backtest_data['strat_ret_net'] = backtest_data['strat_ret_gross'] - (backtest_data['trades'] * FRICTION_PER_TRADE)
     backtest_data['bnh_ret'] = backtest_data['log_ret']
+    
     backtest_data = backtest_data.dropna()
 
     # Calculate and Print Metrics
-    strat_metrics = calculate_metrics(backtest_data['strat_ret'], name="AI Regime Predictor (Asymmetric + Panic Block)")
+    metrics_gross = calculate_metrics(backtest_data['strat_ret_gross'], name="AI Regime Predictor (GROSS)")
+    metrics_net = calculate_metrics(backtest_data['strat_ret_net'], name="AI Regime Predictor (NET)")
     bnh_metrics = calculate_metrics(backtest_data['bnh_ret'], name="Buy & Hold (Nifty 50)")
 
-    print("\n" + "="*80)
-    print(" OUT-OF-SAMPLE BACKTEST RESULTS ".center(80, "="))
+    print("\n" + "="*85)
+    print(" FINAL OUT-OF-SAMPLE BACKTEST RESULTS (WITH TRANSACTION COSTS) ".center(85, "="))
     print(f" Testing Period: {backtest_data.index[0].strftime('%Y-%m-%d')} to {backtest_data.index[-1].strftime('%Y-%m-%d')}")
-    print("="*80)
+    print(f" Simulated Friction: {FRICTION_PER_TRADE*10000:.0f} bps per trade")
+    print(f" Total Trades Executed: {int(backtest_data['trades'].sum())}")
+    print("="*85)
     
-    metrics_df = pd.DataFrame([bnh_metrics, strat_metrics]).set_index("Name")
+    metrics_df = pd.DataFrame([bnh_metrics, metrics_gross, metrics_net]).set_index("Name")
     print(metrics_df.to_markdown())
-    print("="*80)
+    print("="*85)
     
-    backtest_data['cum_strat'] = np.exp(backtest_data['strat_ret'].cumsum())
+    # Save Equity Curve for charting
+    backtest_data['cum_strat_net'] = np.exp(backtest_data['strat_ret_net'].cumsum())
     backtest_data['cum_bnh'] = np.exp(backtest_data['bnh_ret'].cumsum())
-    backtest_data[['cum_strat', 'cum_bnh']].to_csv("equity_curve.csv")
-    print("\nEquity curve saved to equity_curve.csv.")
+    backtest_data[['cum_strat_net', 'cum_bnh']].to_csv("equity_curve.csv")
+    print("\nNet Equity curve saved to equity_curve.csv.")
 
 if __name__ == "__main__":
     main()
