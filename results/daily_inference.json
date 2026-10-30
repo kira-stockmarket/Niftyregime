@@ -1,11 +1,11 @@
 {
-    "timestamp": "2026-10-29T17:05:42.268928",
-    "latest_close": 22936.75,
-    "meta_probability_success": 0.3329054117202759,
-    "target_allocation_weight": 0.0,
+    "timestamp": "2026-10-30T16:50:23.639307",
+    "latest_close": 23053.099609375,
+    "meta_probability_success": 0.7530644536018372,
+    "target_allocation_weight": 0.7530644536018372,
     "regime_probabilities": {
-        "r1": 0.972550218050594,
-        "r2": 0.022269121694530613,
-        "r3": 0.005180660254924735
+        "r1": 0.47853534278468257,
+        "r2": 0.0024069247580307475,
+        "r3": 0.5190577324576788
     }
 }
